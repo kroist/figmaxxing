@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import type { FigmaDestination } from '../types.js';
+import { log, logError } from './logger.js';
 
 type Team = { name: string; planKey: string };
 type FigmaFile = { name: string; fileKey: string };
@@ -11,6 +12,7 @@ export type FigmaOptions = { teams: Team[]; files: FigmaFile[] };
  */
 export function spawnClaude(prompt: string, timeoutMs = 60_000): Promise<string> {
   return new Promise((resolve, reject) => {
+    log(`Claude spawn: ${prompt.slice(0, 120)}...`);
     // --allowedTools is variadic (<tools...>) and eats all remaining positional args,
     // so we pass the prompt via stdin instead of as a positional argument.
     const args = [
@@ -20,9 +22,13 @@ export function spawnClaude(prompt: string, timeoutMs = 60_000): Promise<string>
       '--allowedTools', 'mcp__figma__generate_figma_design',
     ];
 
+    // Strip CLAUDECODE env var to avoid "nested session" block
+    const env = { ...process.env };
+    delete env.CLAUDECODE;
+
     const proc = spawn('claude', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env },
+      env,
     });
 
     proc.stdin.write(prompt);
@@ -51,13 +57,17 @@ export function spawnClaude(prompt: string, timeoutMs = 60_000): Promise<string>
     proc.on('close', (code) => {
       clearTimeout(timer);
       if (code !== 0) {
-        reject(new Error(`Claude exited with code ${code}. stderr: ${stderr.trim()}`));
+        const err = new Error(`Claude exited with code ${code}. stderr: ${stderr.trim()}`);
+        logError('Claude spawn', err);
+        reject(err);
         return;
       }
       try {
         const text = extractAssistantText(stdout);
+        log(`Claude response: ${text.slice(0, 200)}`);
         resolve(text);
       } catch (e: any) {
+        logError('Claude parse', e);
         reject(new Error(`Could not parse Claude output: ${e.message}\nRaw: ${stdout.slice(0, 500)}`));
       }
     });
@@ -162,29 +172,166 @@ export async function generateCaptureId(destination: FigmaDestination): Promise<
   );
 }
 
+export type ClaudeStatus = {
+  available: boolean;
+  hasFigmaMcp: boolean;
+  mcpWarmedUp: boolean;
+};
+
 /**
- * Check if Claude Code is installed and if Figma MCP is available.
+ * Check if Claude Code is installed, if Figma MCP is configured, and if MCP is warmed up.
+ *
+ * `--print` mode doesn't see MCP tools until the user opens Claude interactively once
+ * (which triggers OAuth token exchange / caching). We detect this "cold start" state
+ * by doing a quick `--print` probe after confirming MCP is configured.
  */
-export async function checkClaudeAvailable(): Promise<{ available: boolean; hasFigmaMcp: boolean }> {
+export async function checkClaudeAvailable(): Promise<ClaudeStatus> {
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+
   // Check if claude is on PATH
   try {
     await new Promise<void>((resolve, reject) => {
-      const proc = spawn('claude', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const proc = spawn('claude', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], env });
       proc.on('error', reject);
       proc.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`exit ${code}`))));
     });
   } catch {
-    return { available: false, hasFigmaMcp: false };
+    return { available: false, hasFigmaMcp: false, mcpWarmedUp: false };
   }
 
-  // Check for Figma MCP
+  // Check for Figma MCP via `claude mcp list` (reliable, no LLM involved)
+  let hasFigma = false;
   try {
-    const text = await spawnClaude('List your available MCP tools. Just list the tool names, nothing else.', 30_000);
-    const hasFigma = text.toLowerCase().includes('figma');
-    return { available: true, hasFigmaMcp: hasFigma };
-  } catch {
-    return { available: true, hasFigmaMcp: false };
+    const output = await new Promise<string>((resolve, reject) => {
+      const proc = spawn('claude', ['mcp', 'list'], { stdio: ['ignore', 'pipe', 'pipe'], env });
+      let stdout = '';
+      proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.on('error', reject);
+      proc.on('close', (code) => (code === 0 ? resolve(stdout) : reject(new Error(`exit ${code}`))));
+    });
+    log(`claude mcp list: ${output.trim()}`);
+    hasFigma = output.includes('figma') && output.includes('Connected');
+  } catch (err) {
+    logError('claude mcp list', err);
+    return { available: true, hasFigmaMcp: false, mcpWarmedUp: false };
   }
+
+  if (!hasFigma) {
+    return { available: true, hasFigmaMcp: false, mcpWarmedUp: false };
+  }
+
+  // Probe: check if --print mode can actually see MCP tools (cold start detection)
+  let mcpWarmedUp = false;
+  try {
+    const probe = await new Promise<string>((resolve, reject) => {
+      const probeEnv = { ...process.env };
+      delete probeEnv.CLAUDECODE;
+
+      const proc = spawn('claude', [
+        '--print',
+        '--model', 'haiku',
+        '--output-format', 'text',
+        '--allowedTools', 'mcp__figma__whoami',
+      ], { stdio: ['pipe', 'pipe', 'pipe'], env: probeEnv });
+
+      proc.stdin.write('Do you have the mcp__figma__whoami tool? Answer ONLY "yes" or "no".');
+      proc.stdin.end();
+
+      let stdout = '';
+      proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+
+      const timer = setTimeout(() => {
+        proc.kill('SIGTERM');
+        resolve('');
+      }, 15_000);
+
+      proc.on('close', () => {
+        clearTimeout(timer);
+        resolve(stdout);
+      });
+      proc.on('error', () => {
+        clearTimeout(timer);
+        resolve('');
+      });
+    });
+    log(`MCP warmup probe: ${probe.trim().slice(0, 100)}`);
+    mcpWarmedUp = probe.toLowerCase().includes('yes');
+  } catch {
+    mcpWarmedUp = false;
+  }
+
+  return { available: true, hasFigmaMcp: true, mcpWarmedUp };
+}
+
+/**
+ * Warm up MCP by spawning Claude in a pseudo-TTY and asking it to list MCP tools.
+ *
+ * Claude Code only loads MCP servers when it detects a real TTY. Piped stdio
+ * (including --print mode) skips MCP initialization. We use macOS `script`
+ * command to wrap Claude in a PTY so it initializes MCP properly. This
+ * triggers the OAuth token exchange / caching that --print mode needs later.
+ */
+export function warmupMcp(): Promise<boolean> {
+  return new Promise((resolve) => {
+    log('Warming up MCP via PTY...');
+    let resolved = false;
+    const done = (result: boolean) => {
+      if (resolved) return;
+      resolved = true;
+      proc.kill('SIGTERM');
+      resolve(result);
+    };
+
+    const env = { ...process.env };
+    delete env.CLAUDECODE;
+
+    // python3 pty.spawn creates a real PTY for Claude so it loads MCP servers
+    const proc = spawn('python3', [
+      '-c',
+      'import pty; pty.spawn(["claude"])',
+    ], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env,
+    });
+
+    let stdout = '';
+    proc.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString();
+      // Resolve immediately once we see figma tools in the output
+      if (stdout.toLowerCase().includes('figma')) {
+        log(`MCP warmup: figma detected in output (${stdout.length} bytes)`);
+        done(true);
+      }
+    });
+    proc.stderr.on('data', (chunk: Buffer) => {
+      log(`MCP warmup stderr: ${chunk.toString().trim()}`);
+    });
+
+    const timer = setTimeout(() => {
+      log(`MCP warmup timed out, stdout: ${stdout.length} bytes`);
+      done(false);
+    }, 30_000);
+
+    // Send the probe after a short startup delay
+    setTimeout(() => {
+      if (resolved) return;
+      log('MCP warmup: sending probe...');
+      proc.stdin.write('list mcp tools\n');
+    }, 3_000);
+
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      log(`MCP warmup exited with code ${code}`);
+      done(stdout.toLowerCase().includes('figma'));
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      logError('MCP warmup', err);
+      done(false);
+    });
+  });
 }
 
 /**

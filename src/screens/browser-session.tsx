@@ -6,6 +6,7 @@ import type { CaptureConfig } from '../types.js';
 import { launchBrowser, type BrowserSession as BSession } from '../lib/browser.js';
 import { injectCaptureToolbar, type CaptureResult } from '../lib/capture.js';
 import StatusBar from '../components/status-bar.js';
+import { log, logError, logSessionInfo, endSession } from '../lib/logger.js';
 
 type Props = {
   config: CaptureConfig;
@@ -27,6 +28,8 @@ export default function BrowserSession({ config, onComplete }: Props) {
   function finish() {
     if (completedRef.current) return;
     completedRef.current = true;
+    log(`Session finishing — ${captureCount} capture(s) submitted`);
+    endSession();
     sessionRef.current?.browser.close().catch(() => {});
     onComplete({ success: captureCount > 0 });
   }
@@ -36,8 +39,17 @@ export default function BrowserSession({ config, onComplete }: Props) {
 
     // Track submissions from the Figma toolbar
     eventsRef.current.on('capture:submitted', () => {
+      log('Capture submitted to Figma');
       setCaptureCount((c) => c + 1);
     });
+
+    logSessionInfo({
+      url: config.url,
+      wallet: config.wallet.address,
+      chain: `${config.chain.name} (${config.chain.id})`,
+      captureId: config.captureId,
+    });
+    log('Launching browser...');
 
     launchBrowser(config, eventsRef.current)
       .then((session) => {
@@ -46,6 +58,7 @@ export default function BrowserSession({ config, onComplete }: Props) {
           return;
         }
         sessionRef.current = session;
+        log('Browser launched successfully');
         setStatus('open');
 
         session.browser.on('disconnected', () => {
@@ -54,6 +67,7 @@ export default function BrowserSession({ config, onComplete }: Props) {
       })
       .catch((err) => {
         if (cancelled) return;
+        logError('Browser launch', err);
         setLaunchError(err.message);
         setTimeout(() => exit(), 100);
       });

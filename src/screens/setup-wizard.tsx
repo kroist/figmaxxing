@@ -3,7 +3,7 @@ import { Text, Box, useInput, useApp } from 'ink';
 import Spinner from 'ink-spinner';
 import { existsSync } from 'fs';
 import { spawn } from 'child_process';
-import { checkClaudeAvailable } from '../lib/claude.js';
+import { checkClaudeAvailable, warmupMcp } from '../lib/claude.js';
 import { loadWallets, createWallet } from '../lib/wallet.js';
 import { markSetupComplete } from '../lib/config.js';
 
@@ -75,7 +75,7 @@ export default function SetupWizard({ onComplete }: Props) {
   }
 
   function finish() {
-    markSetupComplete();
+    // markSetupComplete();
     setPhase('done');
     setTimeout(() => onComplete(), 800);
   }
@@ -141,15 +141,24 @@ export default function SetupWizard({ onComplete }: Props) {
       updateCheck(3, { status: 'checking' });
       try {
         const result = await checkClaudeAvailable();
-        if (result.hasFigmaMcp) {
-          updateCheck(3, { status: 'ok', detail: 'Connected' });
-        } else {
+        if (!result.hasFigmaMcp) {
           fatal(3, 'Figma MCP not configured',
             'Figma MCP is not configured in Claude Code.\n\n' +
             'Run: claude mcp add --scope user --transport http figma https://mcp.figma.com/mcp\n' +
             'Then: open Claude, type /mcp, select figma, Authenticate, Allow Access');
           return;
         }
+        if (!result.mcpWarmedUp) {
+          updateCheck(3, { status: 'checking', detail: 'Warming up MCP...' });
+          const warmed = await warmupMcp();
+          if (!warmed) {
+            fatal(3, 'Figma MCP warmup failed',
+              'Could not initialize Figma MCP for non-interactive use.\n\n' +
+              'Please open Claude manually, type "list mcp tools", then restart figmaxxing.');
+            return;
+          }
+        }
+        updateCheck(3, { status: 'ok', detail: 'Connected' });
       } catch {
         fatal(3, 'Check failed',
           'Could not verify Figma MCP.\n\n' +

@@ -1,5 +1,6 @@
 import type { BrowserContext, Page } from 'playwright';
 import { EventEmitter } from 'events';
+import { log, logError } from './logger.js';
 
 export type CaptureResult = {
   success: boolean;
@@ -19,12 +20,14 @@ export async function setupFigmaProxy(
   events?: EventEmitter,
 ): Promise<void> {
   await context.exposeFunction('__submitCapture', async (targetUrl: string, dataStr: string) => {
+    log(`Capture submit → ${targetUrl}`);
     const response = await fetch(targetUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: dataStr,
     });
     const text = await response.text();
+    log(`Capture response: ${response.status}`);
     events?.emit('capture:submitted', text);
     return text;
   });
@@ -44,11 +47,14 @@ export async function injectCaptureToolbar(
   captureId: string,
 ): Promise<CaptureResult> {
   // 1. Fetch the capture script
+  log('Fetching Figma capture script...');
   let scriptText: string;
   try {
     const resp = await context.request.get('https://mcp.figma.com/mcp/html-to-design/capture.js');
     scriptText = await resp.text();
+    log(`Capture script fetched (${scriptText.length} bytes)`);
   } catch (err: any) {
+    logError('Fetch capture script', err);
     return {
       success: false,
       error: `Could not fetch Figma capture script from mcp.figma.com. Check your internet connection. ${err.message}`,

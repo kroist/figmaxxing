@@ -3,6 +3,7 @@ import type { BrowserContext } from 'playwright';
 import { createWalletClient, http, type Hex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { CaptureConfig, TxRequest } from '../types.js';
+import { log, logError } from './logger.js';
 
 let requestIdCounter = 0;
 
@@ -27,6 +28,7 @@ export async function setupRpcProxy(
   const walletClient = createWalletClient({ account, chain, transport: http(config.chain.rpc) });
 
   await context.exposeFunction('__rpcProxy', async (method: string, params: any[]) => {
+    log(`RPC → ${method}`);
     try {
       switch (method) {
         case 'eth_accounts':
@@ -147,6 +149,7 @@ export async function setupRpcProxy(
         }
       }
     } catch (err: any) {
+      logError(`RPC ${method}`, err);
       throw new Error(err.message || String(err));
     }
   });

@@ -4,7 +4,7 @@ import Spinner from 'ink-spinner';
 import { EventEmitter } from 'events';
 import type { CaptureConfig } from '../types.js';
 import { launchBrowser, type BrowserSession as BSession } from '../lib/browser.js';
-import { executeCapture, type CaptureResult } from '../lib/capture.js';
+import { injectCaptureToolbar, type CaptureResult } from '../lib/capture.js';
 import StatusBar from '../components/status-bar.js';
 
 type Props = {
@@ -12,17 +12,32 @@ type Props = {
   onComplete: (result: CaptureResult) => void;
 };
 
-type Status = 'launching' | 'open' | 'capturing' | 'done' | 'error';
+type Status = 'launching' | 'open' | 'injecting';
 
 export default function BrowserSession({ config, onComplete }: Props) {
   const { exit } = useApp();
   const [status, setStatus] = useState<Status>('launching');
-  const [error, setError] = useState('');
+  const [launchError, setLaunchError] = useState('');
+  const [toolbarReady, setToolbarReady] = useState(false);
+  const [captureCount, setCaptureCount] = useState(0);
   const sessionRef = useRef<BSession | null>(null);
   const eventsRef = useRef(new EventEmitter());
+  const completedRef = useRef(false);
+
+  function finish() {
+    if (completedRef.current) return;
+    completedRef.current = true;
+    sessionRef.current?.browser.close().catch(() => {});
+    onComplete({ success: captureCount > 0 });
+  }
 
   useEffect(() => {
     let cancelled = false;
+
+    // Track submissions from the Figma toolbar
+    eventsRef.current.on('capture:submitted', () => {
+      setCaptureCount((c) => c + 1);
+    });
 
     launchBrowser(config, eventsRef.current)
       .then((session) => {
@@ -33,19 +48,13 @@ export default function BrowserSession({ config, onComplete }: Props) {
         sessionRef.current = session;
         setStatus('open');
 
-        // Listen for browser close (user closed the window)
         session.browser.on('disconnected', () => {
-          if (!cancelled) {
-            setStatus('error');
-            setError('Browser was closed.');
-            setTimeout(() => exit(), 100);
-          }
+          if (!cancelled) finish();
         });
       })
       .catch((err) => {
         if (cancelled) return;
-        setStatus('error');
-        setError(err.message);
+        setLaunchError(err.message);
         setTimeout(() => exit(), 100);
       });
 
@@ -55,32 +64,38 @@ export default function BrowserSession({ config, onComplete }: Props) {
     };
   }, []);
 
-  useInput((input, key) => {
-    if (status === 'open' && (input === 'c' || input === 'C')) {
-      triggerCapture();
+  useInput((input) => {
+    if (status === 'open' && !toolbarReady && (input === 'c' || input === 'C')) {
+      injectToolbar();
     }
     if (input === 'q' || input === 'Q') {
-      sessionRef.current?.browser.close().catch(() => {});
-      exit();
+      finish();
     }
   });
 
-  async function triggerCapture() {
+  async function injectToolbar() {
     const session = sessionRef.current;
     if (!session) return;
 
-    setStatus('capturing');
-    try {
-      const result = await executeCapture(session.page, session.context, config.captureId);
-      setStatus('done');
-      await session.browser.close().catch(() => {});
-      onComplete(result);
-    } catch (err: any) {
-      setStatus('error');
-      setError(err.message);
-      await session.browser.close().catch(() => {});
-      onComplete({ success: false, error: err.message });
+    setStatus('injecting');
+    const result = await injectCaptureToolbar(session.page, session.context, config.captureId);
+    setStatus('open');
+
+    if (result.success) {
+      setToolbarReady(true);
+    } else {
+      setLaunchError(result.error || 'Failed to inject capture toolbar');
     }
+  }
+
+  if (launchError) {
+    return (
+      <Box flexDirection="column">
+        <StatusBar step={6} label="Browser session" />
+        <Text color="red" bold>Error</Text>
+        <Text color="red">{launchError}</Text>
+      </Box>
+    );
   }
 
   return (
@@ -93,31 +108,41 @@ export default function BrowserSession({ config, onComplete }: Props) {
         </Text>
       )}
 
-      {status === 'open' && (
-        <Box flexDirection="column" marginTop={1}>
-          <Text color="green">Browser is open at <Text bold>{config.url}</Text></Text>
-          <Text>Connect wallet and navigate to the desired state.</Text>
-          <Box marginTop={1}>
-            <Text dimColor>Press </Text>
-            <Text bold color="cyan">[C]</Text>
-            <Text dimColor> to capture when ready</Text>
-            <Text dimColor>  |  </Text>
-            <Text bold color="red">[Q]</Text>
-            <Text dimColor> to quit</Text>
-          </Box>
-        </Box>
-      )}
-
-      {status === 'capturing' && (
+      {status === 'injecting' && (
         <Text>
-          <Spinner type="dots" /> Capturing page...
+          <Spinner type="dots" /> Injecting Figma capture toolbar...
         </Text>
       )}
 
-      {status === 'error' && (
-        <Box flexDirection="column">
-          <Text color="red" bold>Error</Text>
-          <Text color="red">{error}</Text>
+      {status === 'open' && (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color="green">Browser is open at <Text bold>{config.url}</Text></Text>
+
+          {captureCount > 0 && (
+            <Text color="green">{captureCount} capture{captureCount > 1 ? 's' : ''} submitted.</Text>
+          )}
+
+          <Box marginTop={1} flexDirection="column">
+            {!toolbarReady ? (
+              <Box flexDirection="column">
+                <Text>Connect wallet and navigate to the desired state.</Text>
+                <Box marginTop={1}>
+                  <Text bold color="cyan">[C]</Text>
+                  <Text dimColor> inject Figma capture toolbar  </Text>
+                  <Text bold color="red">[Q]</Text>
+                  <Text dimColor> quit</Text>
+                </Box>
+              </Box>
+            ) : (
+              <Box flexDirection="column">
+                <Text>Use the Figma toolbar in the browser to capture pages.</Text>
+                <Box marginTop={1}>
+                  <Text bold color="red">[Q]</Text>
+                  <Text dimColor> quit (or close browser)</Text>
+                </Box>
+              </Box>
+            )}
+          </Box>
         </Box>
       )}
     </Box>

@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import { Text } from 'ink';
 import type { Wallet, Chain, FigmaDestination as FigmaDestType } from './types.js';
 import type { CaptureResult } from './lib/capture.js';
+import { isFirstRun } from './lib/config.js';
+import SetupWizard from './screens/setup-wizard.js';
 import WalletSelector from './screens/wallet-selector.js';
 import ChainPicker from './screens/chain-picker.js';
 import UrlInput from './screens/url-input.js';
@@ -10,10 +12,10 @@ import CaptureIdScreen from './screens/capture-id.js';
 import BrowserSession from './screens/browser-session.js';
 import ResultScreen from './screens/result.js';
 
-type Screen = 'wallet' | 'chain' | 'url' | 'figma' | 'captureId' | 'browser' | 'result';
+type Screen = 'setup' | 'wallet' | 'chain' | 'url' | 'figma' | 'captureId' | 'browser' | 'result';
 
 export default function App() {
-  const [screen, setScreen] = useState<Screen>('wallet');
+  const [screen, setScreen] = useState<Screen>(isFirstRun() ? 'setup' : 'wallet');
   const [wallet, setWallet] = useState<Wallet | null>(null);
   const [chain, setChain] = useState<Chain | null>(null);
   const [url, setUrl] = useState('');
@@ -22,6 +24,9 @@ export default function App() {
   const [captureResult, setCaptureResult] = useState<CaptureResult | null>(null);
 
   switch (screen) {
+    case 'setup':
+      return <SetupWizard onComplete={() => setScreen('wallet')} />;
+
     case 'wallet':
       return (
         <WalletSelector

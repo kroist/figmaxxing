@@ -22,7 +22,7 @@ export async function launchBrowser(
 
   // Setup exposed functions before any page loads
   await setupRpcProxy(context, config, events);
-  await setupFigmaProxy(context, config.captureId);
+  await setupFigmaProxy(context, config.captureId, events);
   await injectWalletProvider(context, config.wallet.address, config.chain.hexId, config.chain.id);
 
   const page = await context.newPage();

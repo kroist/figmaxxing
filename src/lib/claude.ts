@@ -15,6 +15,7 @@ export function spawnClaude(prompt: string, timeoutMs = 60_000): Promise<string>
     // so we pass the prompt via stdin instead of as a positional argument.
     const args = [
       '--print',
+      '--model', 'sonnet',
       '--output-format', 'json',
       '--allowedTools', 'mcp__figma__generate_figma_design',
     ];

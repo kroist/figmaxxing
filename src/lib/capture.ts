@@ -1,4 +1,5 @@
 import type { BrowserContext, Page } from 'playwright';
+import { EventEmitter } from 'events';
 
 export type CaptureResult = {
   success: boolean;
@@ -9,31 +10,35 @@ export type CaptureResult = {
  * Expose the __submitCapture function on the browser context.
  * This proxies fetch calls from capture.js to mcp.figma.com through Node.js
  * (bypassing any CSP restrictions in the page).
+ *
+ * Emits 'capture:submitted' on the events emitter whenever a submission goes through.
  */
 export async function setupFigmaProxy(
   context: BrowserContext,
-  captureId: string,
+  _captureId: string,
+  events?: EventEmitter,
 ): Promise<void> {
-  const endpoint = `https://mcp.figma.com/mcp/capture/${captureId}/submit`;
-
-  await context.exposeFunction('__submitCapture', async (dataStr: string) => {
-    const response = await fetch(endpoint, {
+  await context.exposeFunction('__submitCapture', async (targetUrl: string, dataStr: string) => {
+    const response = await fetch(targetUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: dataStr,
     });
-    return await response.text();
+    const text = await response.text();
+    events?.emit('capture:submitted', text);
+    return text;
   });
 }
 
 /**
- * Execute the Figma capture:
+ * Inject the Figma capture toolbar into the page:
  * 1. Fetch capture.js from mcp.figma.com
  * 2. Inject into page via evaluate (bypasses CSP)
  * 3. Monkey-patch fetch to route mcp.figma.com calls through __submitCapture
- * 4. Call captureForDesign()
+ *
+ * The Figma toolbar handles the actual capture — the user clicks "capture" in the browser.
  */
-export async function executeCapture(
+export async function injectCaptureToolbar(
   page: Page,
   context: BrowserContext,
   captureId: string,
@@ -54,19 +59,14 @@ export async function executeCapture(
   await page.evaluate(scriptText);
   await page.waitForTimeout(1000);
 
-  // 3. Verify it loaded
-  const hasFigma = await page.evaluate(() => typeof (window as any).figma?.captureForDesign === 'function');
-  if (!hasFigma) {
-    return { success: false, error: 'Capture script failed to load. captureForDesign function not found.' };
-  }
-
-  // 4. Run capture with fetch monkey-patch
-  const result = await page.evaluate(async (cid: string) => {
-    try {
+  // 3. Monkey-patch fetch so the toolbar's submissions go through our Node.js proxy
+  // 4. Fire off captureForDesign (this shows the toolbar) — don't await it
+  await page.evaluate((cid: string) => {
+    if (!(window as any).__fetchPatched) {
       const originalFetch = window.fetch;
       window.fetch = async (url: any, opts: any) => {
         if (typeof url === 'string' && url.includes('mcp.figma.com')) {
-          const responseText = await (window as any).__submitCapture(opts.body);
+          const responseText = await (window as any).__submitCapture(url, opts?.body);
           return new Response(responseText, {
             status: 200,
             headers: { 'Content-Type': 'application/json' },
@@ -74,20 +74,17 @@ export async function executeCapture(
         }
         return originalFetch(url, opts);
       };
-
-      return await (window as any).figma.captureForDesign({
-        captureId: cid,
-        endpoint: `https://mcp.figma.com/mcp/capture/${cid}/submit`,
-        selector: 'body',
-      });
-    } catch (err: any) {
-      return { success: false, error: err.message };
+      (window as any).__fetchPatched = true;
     }
-  }, captureId);
 
-  if (result && typeof result === 'object' && 'error' in result && result.error) {
-    return { success: false, error: `Capture failed: ${result.error}` };
-  }
+    // Fire-and-forget: captureForDesign shows the toolbar, captures are
+    // handled by the fetch monkey-patch + __submitCapture proxy
+    (window as any).figma?.captureForDesign({
+      captureId: cid,
+      endpoint: `https://mcp.figma.com/mcp/capture/${cid}/submit`,
+      selector: 'body',
+    }).catch(() => {});
+  }, captureId);
 
   return { success: true };
 }

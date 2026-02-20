@@ -28,6 +28,28 @@ export async function setupFigmaProxy(
     });
     const text = await response.text();
     log(`Capture response: ${response.status}`);
+    log(`Capture response body: ${text.slice(0, 500)}`);
+
+    // Parse structured response from Figma capture API
+    try {
+      const data = JSON.parse(text);
+      if (data.claimUrl) {
+        log(`Claim URL: ${data.claimUrl}`);
+        events?.emit('capture:claimUrl', data.claimUrl);
+      }
+      if (data.nextCaptureId) {
+        log(`Next capture ID: ${data.nextCaptureId}`);
+        events?.emit('capture:nextId', data.nextCaptureId);
+      }
+    } catch {
+      // Not JSON — try regex fallback for any Figma URL
+      const figmaUrl = text.match(/https?:\/\/(?:www\.)?figma\.com\/[^\s"'<>]+/);
+      if (figmaUrl) {
+        log(`Figma URL found in response: ${figmaUrl[0]}`);
+        events?.emit('capture:claimUrl', figmaUrl[0]);
+      }
+    }
+
     events?.emit('capture:submitted', text);
     return text;
   });
@@ -94,3 +116,32 @@ export async function injectCaptureToolbar(
 
   return { success: true };
 }
+
+/**
+ * Intercept popups (new tabs) from the capture widget that navigate to figma.com.
+ * When the widget's "link" button opens the Figma file, Playwright creates a new page.
+ * We catch it, extract the URL, emit it, and close the popup.
+ */
+export function interceptFigmaPopups(
+  context: BrowserContext,
+  events?: EventEmitter,
+): void {
+  context.on('page', async (popup) => {
+    const url = popup.url();
+    log(`Popup opened: ${url}`);
+    if (url.includes('figma.com')) {
+      events?.emit('capture:figmaUrl', url);
+    }
+    // Also listen if the popup navigates after opening (about:blank → figma URL)
+    popup.on('framenavigated', (frame) => {
+      if (frame === popup.mainFrame()) {
+        const navUrl = frame.url();
+        if (navUrl.includes('figma.com') && navUrl !== 'about:blank') {
+          log(`Popup navigated to: ${navUrl}`);
+          events?.emit('capture:figmaUrl', navUrl);
+        }
+      }
+    });
+  });
+}
+

@@ -21,6 +21,8 @@ export default function BrowserSession({ config, onComplete }: Props) {
   const [launchError, setLaunchError] = useState('');
   const [toolbarReady, setToolbarReady] = useState(false);
   const [captureCount, setCaptureCount] = useState(0);
+  const [claimUrl, setClaimUrl] = useState('');
+  const [figmaUrl, setFigmaUrl] = useState('');
   const sessionRef = useRef<BSession | null>(null);
   const eventsRef = useRef(new EventEmitter());
   const completedRef = useRef(false);
@@ -29,7 +31,7 @@ export default function BrowserSession({ config, onComplete }: Props) {
     if (completedRef.current) return;
     completedRef.current = true;
     log(`Session finishing — ${captureCount} capture(s) submitted`);
-    endSession();
+    endSession({ figmaUrl: claimUrl || figmaUrl || undefined });
     sessionRef.current?.browser.close().catch(() => {});
     onComplete({ success: captureCount > 0 });
   }
@@ -41,6 +43,18 @@ export default function BrowserSession({ config, onComplete }: Props) {
     eventsRef.current.on('capture:submitted', () => {
       log('Capture submitted to Figma');
       setCaptureCount((c) => c + 1);
+    });
+
+    // Claim URL from capture response (new files need to be claimed first)
+    eventsRef.current.on('capture:claimUrl', (url: string) => {
+      log(`Claim URL received: ${url}`);
+      setClaimUrl(url);
+    });
+
+    // Figma file URL from popup interception (widget link button)
+    eventsRef.current.on('capture:figmaUrl', (url: string) => {
+      log(`Figma URL intercepted: ${url}`);
+      setFigmaUrl(url);
     });
 
     logSessionInfo({
@@ -134,6 +148,20 @@ export default function BrowserSession({ config, onComplete }: Props) {
 
           {captureCount > 0 && (
             <Text color="green">{captureCount} capture{captureCount > 1 ? 's' : ''} submitted.</Text>
+          )}
+
+          {claimUrl && (
+            <Box marginTop={1} flexDirection="column">
+              <Text color="yellow" bold>Open this URL to claim your Figma file:</Text>
+              <Text color="cyan">{claimUrl}</Text>
+            </Box>
+          )}
+
+          {figmaUrl && !claimUrl && (
+            <Box marginTop={1} flexDirection="column">
+              <Text color="yellow" bold>Figma file URL:</Text>
+              <Text color="cyan">{figmaUrl}</Text>
+            </Box>
           )}
 
           <Box marginTop={1} flexDirection="column">

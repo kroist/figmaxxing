@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import type { CaptureConfig } from '../types.js';
 import { setupRpcProxy } from './rpc-proxy.js';
-import { setupFigmaProxy } from './capture.js';
+import { setupFigmaProxy, interceptFigmaPopups } from './capture.js';
 
 export type BrowserSession = {
   browser: Browser;
@@ -23,6 +23,7 @@ export async function launchBrowser(
   // Setup exposed functions before any page loads
   await setupRpcProxy(context, config, events);
   await setupFigmaProxy(context, config.captureId, events);
+  interceptFigmaPopups(context, events);
   await injectWalletProvider(context, config.wallet.address, config.chain.hexId, config.chain.id);
 
   const page = await context.newPage();

@@ -1,6 +1,6 @@
 {
   "name": "figmaxxing",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Capture any EVM DApp's UI into Figma with an injected wallet, powered by a terminal interface",
   "type": "module",
   "main": "dist/cli.js",

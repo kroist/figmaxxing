@@ -1,6 +1,40 @@
 import { spawn } from 'child_process';
+import { chmodSync, statSync } from 'fs';
+import { join, dirname } from 'path';
+import { createRequire } from 'module';
 import type { FigmaDestination } from '../types.js';
 import { log, logError } from './logger.js';
+
+const esmRequire = createRequire(import.meta.url);
+
+/**
+ * Ensure node-pty's spawn-helper binary is executable.
+ * npm strips execute bits from prebuilt binaries during packaging.
+ */
+function ensurePtyPermissions(): void {
+  try {
+    const ptyPath = dirname(esmRequire.resolve('node-pty'));
+    const platform = `${process.platform}-${process.arch}`;
+    const helper = join(ptyPath, 'prebuilds', platform, 'spawn-helper');
+    const stat = statSync(helper);
+    if (!(stat.mode & 0o111)) {
+      chmodSync(helper, stat.mode | 0o755);
+      log(`Fixed spawn-helper permissions: ${helper}`);
+    }
+  } catch {
+    // Best effort — pty.spawn will give a clear error if this didn't work
+  }
+}
+
+let pty: typeof import('node-pty') | null = null;
+
+function loadPty(): typeof import('node-pty') {
+  if (!pty) {
+    ensurePtyPermissions();
+    pty = esmRequire('node-pty') as typeof import('node-pty');
+  }
+  return pty;
+}
 
 type Team = { name: string; planKey: string };
 type FigmaFile = { name: string; fileKey: string };
@@ -272,65 +306,67 @@ export async function checkClaudeAvailable(): Promise<ClaudeStatus> {
  * command to wrap Claude in a PTY so it initializes MCP properly. This
  * triggers the OAuth token exchange / caching that --print mode needs later.
  */
-export function warmupMcp(): Promise<boolean> {
-  return new Promise((resolve) => {
-    log('Warming up MCP via PTY...');
+export async function warmupMcp(): Promise<boolean> {
+  log('Warming up MCP via PTY...');
+
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+
+  const nodePty = loadPty();
+  let ptyProc: import('node-pty').IPty;
+  try {
+    ptyProc = nodePty.spawn('/bin/sh', ['-c', 'claude'], {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 30,
+      env,
+    });
+    log(`MCP warmup: PTY spawned, pid=${ptyProc.pid}`);
+  } catch (err) {
+    logError('MCP warmup: pty.spawn failed', err);
+    return false;
+  }
+
+  return new Promise<boolean>((resolve) => {
     let resolved = false;
+    let output = '';
+
     const done = (result: boolean) => {
       if (resolved) return;
       resolved = true;
-      proc.kill('SIGTERM');
+      clearTimeout(timer);
+      try { ptyProc.kill(); } catch {}
+      log(`MCP warmup: done(${result})`);
       resolve(result);
     };
 
-    const env = { ...process.env };
-    delete env.CLAUDECODE;
-
-    // python3 pty.spawn creates a real PTY for Claude so it loads MCP servers
-    const proc = spawn('python3', [
-      '-c',
-      'import pty; pty.spawn(["claude"])',
-    ], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env,
-    });
-
-    let stdout = '';
-    proc.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
-      // Resolve immediately once we see figma tools in the output
-      if (stdout.toLowerCase().includes('figma')) {
-        log(`MCP warmup: figma detected in output (${stdout.length} bytes)`);
+    ptyProc.onData((data) => {
+      output += data;
+      if (output.toLowerCase().includes('figma')) {
+        log(`MCP warmup: figma detected (${output.length} bytes)`);
         done(true);
       }
     });
-    proc.stderr.on('data', (chunk: Buffer) => {
-      log(`MCP warmup stderr: ${chunk.toString().trim()}`);
+
+    ptyProc.onExit(({ exitCode }) => {
+      log(`MCP warmup PTY exited with code ${exitCode}`);
+      done(output.toLowerCase().includes('figma'));
     });
 
     const timer = setTimeout(() => {
-      log(`MCP warmup timed out, stdout: ${stdout.length} bytes`);
+      log(`MCP warmup timed out, output: ${output.length} bytes`);
       done(false);
     }, 30_000);
 
-    // Send the probe after a short startup delay
+    // Send probe after short startup delay for MCP to connect
     setTimeout(() => {
       if (resolved) return;
       log('MCP warmup: sending probe...');
-      proc.stdin.write('list mcp tools\n');
+      try { ptyProc.write('list mcp tools\r'); } catch (err) {
+        logError('MCP warmup: write failed', err);
+        done(false);
+      }
     }, 3_000);
-
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      log(`MCP warmup exited with code ${code}`);
-      done(stdout.toLowerCase().includes('figma'));
-    });
-
-    proc.on('error', (err) => {
-      clearTimeout(timer);
-      logError('MCP warmup', err);
-      done(false);
-    });
   });
 }
 

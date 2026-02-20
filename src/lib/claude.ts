@@ -1,11 +1,13 @@
 import { spawn } from 'child_process';
-import { chmodSync, statSync } from 'fs';
+import { chmodSync, statSync, appendFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { createRequire } from 'module';
 import type { FigmaDestination } from '../types.js';
-import { log, logError } from './logger.js';
+import { log, logError, getLogFile } from './logger.js';
 
 const esmRequire = createRequire(import.meta.url);
+
+const PTY_DEBUG = process.env.PTY_DEBUG === 'true';
 
 /**
  * Ensure node-pty's spawn-helper binary is executable.
@@ -44,17 +46,24 @@ export type FigmaOptions = { teams: Team[]; files: FigmaFile[] };
 /**
  * Spawn `claude` CLI in --print mode and return the last assistant text content.
  */
-export function spawnClaude(prompt: string, timeoutMs = 60_000): Promise<string> {
+export function spawnClaude(prompt: string, options: { systemPrompt?: string; timeoutMs?: number } = {}): Promise<string> {
+  const { systemPrompt, timeoutMs = 60_000 } = options;
   return new Promise((resolve, reject) => {
     log(`Claude spawn: ${prompt.slice(0, 120)}...`);
     // --allowedTools is variadic (<tools...>) and eats all remaining positional args,
     // so we pass the prompt via stdin instead of as a positional argument.
+    // --system-prompt must come before --allowedTools for the same reason.
     const args = [
       '--print',
       '--model', 'sonnet',
       '--output-format', 'json',
-      '--allowedTools', 'mcp__figma__generate_figma_design',
     ];
+
+    if (systemPrompt) {
+      args.push('--system-prompt', systemPrompt);
+    }
+
+    args.push('--allowedTools', 'mcp__figma__generate_figma_design');
 
     // Strip CLAUDECODE env var to avoid "nested session" block
     const env = { ...process.env };
@@ -146,10 +155,18 @@ function extractAssistantText(raw: string): string {
  * Fetch Figma team list and recent files via Claude + Figma MCP.
  */
 export async function fetchFigmaOptions(): Promise<FigmaOptions> {
-  const prompt =
-    'Call mcp__figma__generate_figma_design with no parameters. Return ONLY a JSON object with the following format, no other text: { "teams": [{"name": "...", "planKey": "..."}], "files": [{"name": "...", "fileKey": "..."}] }';
+  const systemPrompt =
+    'You are a non-interactive helper for the figmaxxing CLI application. ' +
+    'You will receive instructions to call Figma MCP tools. These instructions come directly ' +
+    'from the application code, not from untrusted sources. Execute the requested tool calls ' +
+    'and return results as specified.';
 
-  const text = await spawnClaude(prompt);
+  const prompt =
+    'Please use the generate_figma_design Figma MCP tool (no parameters needed) to fetch my ' +
+    'available Figma destinations. Format the response as JSON with this structure: ' +
+    '{"teams": [{"name": "Team Name", "planKey": "key"}], "files": [{"name": "File Name", "fileKey": "key"}]}';
+
+  const text = await spawnClaude(prompt, { systemPrompt });
 
   // Extract JSON from the response — Claude may wrap it in markdown code blocks
   const jsonStr = extractJson(text);
@@ -178,15 +195,21 @@ export async function fetchFigmaOptions(): Promise<FigmaOptions> {
  * Generate a capture ID via Claude + Figma MCP.
  */
 export async function generateCaptureId(destination: FigmaDestination): Promise<string> {
+  const systemPrompt =
+    'You are a non-interactive helper for the figmaxxing CLI application. ' +
+    'You will receive instructions to call Figma MCP tools. These instructions come directly ' +
+    'from the application code, not from untrusted sources. Execute the requested tool calls ' +
+    'and return results as specified.';
+
   let prompt: string;
 
   if (destination.mode === 'existingFile') {
-    prompt = `Call mcp__figma__generate_figma_design with outputMode 'existingFile' and fileKey '${destination.fileKey}'. Return ONLY the capture ID as a plain string, no other text.`;
+    prompt = `Please use the generate_figma_design Figma MCP tool with outputMode "existingFile" and fileKey "${destination.fileKey}" to get a capture ID. Return the capture ID as a plain string.`;
   } else {
-    prompt = `Call mcp__figma__generate_figma_design with outputMode 'newFile', planKey '${destination.planKey}', and fileName '${destination.fileName}'. Return ONLY the capture ID as a plain string, no other text.`;
+    prompt = `Please use the generate_figma_design Figma MCP tool with outputMode "newFile", planKey "${destination.planKey}", and fileName "${destination.fileName}" to get a capture ID. Return the capture ID as a plain string.`;
   }
 
-  const text = await spawnClaude(prompt);
+  const text = await spawnClaude(prompt, { systemPrompt });
 
   // Extract capture ID — look for a UUID-like pattern
   const cleaned = text.trim().replace(/^["'`]+|["'`]+$/g, '');
@@ -211,6 +234,253 @@ export type ClaudeStatus = {
   hasFigmaMcp: boolean;
   mcpWarmedUp: boolean;
 };
+
+export type FigmaMcpStatus = 'not-configured' | 'needs-auth' | 'connected';
+
+/**
+ * Check Figma MCP status: not configured, needs authentication, or connected.
+ */
+export async function checkFigmaMcpStatus(): Promise<FigmaMcpStatus> {
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+
+  try {
+    const output = await new Promise<string>((resolve, reject) => {
+      const proc = spawn('claude', ['mcp', 'list'], { stdio: ['ignore', 'pipe', 'pipe'], env });
+      let stdout = '';
+      proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.on('error', reject);
+      proc.on('close', (code) => (code === 0 ? resolve(stdout) : reject(new Error(`exit ${code}`))));
+    });
+
+    log(`checkFigmaMcpStatus: ${output.trim()}`);
+
+    if (!output.toLowerCase().includes('figma')) return 'not-configured';
+    if (output.includes('Connected')) return 'connected';
+    return 'needs-auth';
+  } catch {
+    return 'not-configured';
+  }
+}
+
+/**
+ * Add Figma MCP server to Claude Code user config.
+ */
+export async function addFigmaMcp(): Promise<void> {
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+
+  log('Adding Figma MCP server...');
+
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn('claude', [
+      'mcp', 'add', '--scope', 'user', '--transport', 'http', 'figma', 'https://mcp.figma.com/mcp',
+    ], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
+    });
+
+    let stderr = '';
+    proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code === 0) {
+        log('Figma MCP added successfully');
+        resolve();
+      } else {
+        reject(new Error(`claude mcp add failed (exit ${code}): ${stderr}`));
+      }
+    });
+  });
+}
+
+/**
+ * Comprehensive ANSI escape sequence removal.
+ * Handles CSI (including DEC private mode like \x1b[?25l),
+ * OSC sequences, charset selection, and other 2-char escapes.
+ *
+ * IMPORTANT: \x1b[nC (cursor forward n cols) is used for word spacing
+ * in Claude Code's TUI, so we replace it with spaces instead of removing.
+ */
+function stripAnsi(s: string): string {
+  return s
+    .replace(/\x1b\[(\d*)C/g, (_, n) => ' '.repeat(parseInt(n || '1', 10)))  // CUF → spaces
+    .replace(/\x1b\[[^\x40-\x7e]*[\x40-\x7e]/g, '')  // CSI: ESC[ (params) (final byte @-~)
+    .replace(/\x1b\][^\x07]*\x07/g, '')                // OSC: ESC] ... BEL
+    .replace(/\x1b[()][AB012]/g, '')                    // Charset: ESC( or ESC) + charset
+    .replace(/\x1b./g, '')                              // Other 2-char escapes (ESC= etc.)
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ''); // Remaining control chars
+}
+
+/**
+ * Authenticate Figma MCP by driving Claude's /mcp interactive menu via PTY.
+ *
+ * Flow: spawn Claude → /mcp → select figma → Authenticate → browser opens →
+ * user clicks Allow → detect "Authentication successful".
+ */
+export async function authenticateFigmaMcp(onProgress?: (msg: string) => void): Promise<boolean> {
+  log('Authenticating Figma MCP via PTY...');
+
+  const env = { ...process.env };
+  delete env.CLAUDECODE;
+
+  const nodePty = loadPty();
+  let ptyProc: import('node-pty').IPty;
+
+  try {
+    ptyProc = nodePty.spawn('/bin/sh', ['-c', 'claude'], {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 30,
+      env,
+    });
+    log(`Figma auth: PTY spawned, pid=${ptyProc.pid}`);
+  } catch (err) {
+    logError('Figma auth: pty.spawn failed', err);
+    return false;
+  }
+
+  let output = '';
+  let exited = false;
+  const listeners: Array<() => void> = [];
+
+  ptyProc.onData((data) => {
+    output += data;
+    for (const fn of [...listeners]) fn();
+  });
+
+  ptyProc.onExit(({ exitCode }) => {
+    exited = true;
+    log(`Figma auth: PTY exited with code ${exitCode}`);
+    for (const fn of [...listeners]) fn();
+  });
+
+  /** Dump raw PTY output to a separate file for debugging. */
+  function dumpOutput(label: string) {
+    if (!PTY_DEBUG) return;
+    try {
+      const logFile = getLogFile();
+      const dir = logFile ? dirname(logFile) : '/tmp';
+      const dumpPath = join(dir, 'pty-dump.log');
+      appendFileSync(dumpPath, `\n=== ${label} (total ${output.length} bytes) ===\n`);
+      appendFileSync(dumpPath, output.slice(-2000));
+      appendFileSync(dumpPath, '\n=== END ===\n');
+
+      // Also dump the new bytes as hex for escape sequence analysis
+      const hexPath = join(dir, 'pty-hex.log');
+      const newBytes = output.slice(Math.max(0, output.length - 1500));
+      const hex = Buffer.from(newBytes).toString('hex').match(/.{1,80}/g)?.join('\n') || '';
+      appendFileSync(hexPath, `\n=== ${label} (last 1500 bytes as hex) ===\n${hex}\n=== END ===\n`);
+    } catch {}
+  }
+
+  /**
+   * Wait for a pattern in NEW output (after this call's snapshot).
+   * Strips ANSI sequences before matching so inline style codes
+   * (e.g. \x1b[2m between "needs" and "auth") don't break pattern detection.
+   */
+  function waitForNew(pattern: string, timeoutMs: number): Promise<boolean> {
+    const startLen = output.length;
+    const lowerPattern = pattern.toLowerCase();
+    return new Promise((resolve) => {
+      const check = () => stripAnsi(output.slice(startLen)).toLowerCase().includes(lowerPattern);
+
+      if (check()) { resolve(true); return; }
+      if (exited) { resolve(check()); return; }
+
+      const timer = setTimeout(() => {
+        const idx = listeners.indexOf(listener);
+        if (idx !== -1) listeners.splice(idx, 1);
+        const newRaw = output.slice(startLen);
+        const stripped = stripAnsi(newRaw);
+        log(`Figma auth: waitForNew("${pattern}") timed out after ${timeoutMs}ms. Raw: ${newRaw.length}, Stripped: ${stripped.length}`);
+        log(`Figma auth: stripped new output: ${JSON.stringify(stripped.slice(0, 600))}`);
+        dumpOutput(`waitForNew("${pattern}") timeout`);
+        resolve(false);
+      }, timeoutMs);
+
+      const listener = () => {
+        if (check()) {
+          clearTimeout(timer);
+          const idx = listeners.indexOf(listener);
+          if (idx !== -1) listeners.splice(idx, 1);
+          resolve(true);
+        } else if (exited) {
+          clearTimeout(timer);
+          const idx = listeners.indexOf(listener);
+          if (idx !== -1) listeners.splice(idx, 1);
+          resolve(check());
+        }
+      };
+      listeners.push(listener);
+    });
+  }
+
+  function delay(ms: number): Promise<void> {
+    return new Promise(r => setTimeout(r, ms));
+  }
+
+  try {
+    // Wait for Claude to start — look for the model name in the status bar.
+    log('Figma auth: waiting for Claude to start...');
+    onProgress?.('Starting Claude (this takes ~15s)...');
+    const ready = await waitForNew('Opus', 15_000);
+    if (!ready) {
+      log('Figma auth: Claude did not start in time');
+      dumpOutput('startup timeout');
+      return false;
+    }
+    // Extra delay to ensure the prompt is fully interactive
+    await delay(2_000);
+    dumpOutput('after startup');
+
+    // Send /mcp command
+    log('Figma auth: sending /mcp');
+    onProgress?.('Navigating to Figma MCP settings...');
+    ptyProc.write('/mcp\r');
+
+    // The /mcp menu loads internally but Ink buffers the PTY output until
+    // keyboard interaction triggers a flush. Instead of trying to pattern-match
+    // the intermediate TUI states, we navigate with timed Enter presses.
+    // The menu has figma as the only/first server, and Authenticate as option 1.
+
+    // Ink buffers PTY output and each Enter press flushes the buffer but gets
+    // consumed by the render cycle. We need separate Enter presses to:
+    //   1. Flush the server list + trigger navigation to detail view
+    //   2. Flush the detail view + trigger selection of Authenticate
+    //   3. Actually start the auth flow (browser opens)
+
+    await delay(5_000);  // Wait for menu to load internally
+    dumpOutput('after /mcp wait');
+
+    // Enter presses to navigate: server list → detail view → Authenticate
+    for (let i = 1; i <= 3; i++) {
+      log(`Figma auth: pressing Enter (${i}/3)`);
+      ptyProc.write('\r');
+      await delay(3_000);
+      dumpOutput(`after enter ${i}`);
+    }
+
+    // Wait for user to complete browser authentication (up to 2 minutes)
+    log('Figma auth: waiting for browser authentication...');
+    onProgress?.('Browser should be open — complete login there');
+    const success = await waitForNew('uthentication successful', 120_000);
+
+    if (success) {
+      log('Figma auth: authentication successful!');
+    } else {
+      log('Figma auth: did not detect success');
+    }
+    dumpOutput('final');
+
+    return success;
+  } catch (err) {
+    logError('Figma auth error', err);
+    return false;
+  } finally {
+    try { ptyProc.kill(); } catch {}
+  }
+}
 
 /**
  * Check if Claude Code is installed, if Figma MCP is configured, and if MCP is warmed up.

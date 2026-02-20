@@ -3,7 +3,7 @@ import { Text, Box, useInput, useApp } from 'ink';
 import Spinner from 'ink-spinner';
 import { existsSync } from 'fs';
 import { spawn } from 'child_process';
-import { checkClaudeAvailable, warmupMcp } from '../lib/claude.js';
+import { checkClaudeAvailable, warmupMcp, checkFigmaMcpStatus, addFigmaMcp, authenticateFigmaMcp } from '../lib/claude.js';
 import { loadWallets, createWallet } from '../lib/wallet.js';
 import { markSetupComplete } from '../lib/config.js';
 
@@ -23,6 +23,7 @@ type Phase =
   | 'running'
   | 'prompt-chromium'
   | 'installing-chromium'
+  | 'authenticating-figma'
   | 'prompt-wallet'
   | 'wallet-created'
   | 'fatal'
@@ -63,6 +64,7 @@ export default function SetupWizard({ onComplete }: Props) {
   const [currentStep, setCurrentStep] = useState(0);
   const [fatalMessage, setFatalMessage] = useState('');
   const [createdWallet, setCreatedWallet] = useState<{ address: string; privateKey: string } | null>(null);
+  const [authProgress, setAuthProgress] = useState('');
 
   function updateCheck(index: number, update: Partial<CheckItem>) {
     setChecks(prev => prev.map((c, i) => (i === index ? { ...c, ...update } : c)));
@@ -75,7 +77,7 @@ export default function SetupWizard({ onComplete }: Props) {
   }
 
   function finish() {
-    // markSetupComplete();
+    markSetupComplete();
     setPhase('done');
     setTimeout(() => onComplete(), 800);
   }
@@ -140,24 +142,56 @@ export default function SetupWizard({ onComplete }: Props) {
       setCurrentStep(3);
       updateCheck(3, { status: 'checking' });
       try {
-        const result = await checkClaudeAvailable();
-        if (!result.hasFigmaMcp) {
-          fatal(3, 'Figma MCP not configured',
-            'Figma MCP is not configured in Claude Code.\n\n' +
-            'Run: claude mcp add --scope user --transport http figma https://mcp.figma.com/mcp\n' +
-            'Then: open Claude, type /mcp, select figma, Authenticate, Allow Access');
-          return;
-        }
-        if (!result.mcpWarmedUp) {
-          updateCheck(3, { status: 'checking', detail: 'Warming up MCP...' });
-          const warmed = await warmupMcp();
-          if (!warmed) {
-            fatal(3, 'Figma MCP warmup failed',
-              'Could not initialize Figma MCP for non-interactive use.\n\n' +
-              'Please open Claude manually, type "list mcp tools", then restart figmaxxing.');
+        let mcpStatus = await checkFigmaMcpStatus();
+
+        // Auto-add Figma MCP if not configured
+        if (mcpStatus === 'not-configured') {
+          updateCheck(3, { status: 'checking', detail: 'Adding Figma MCP...' });
+          try {
+            await addFigmaMcp();
+            mcpStatus = await checkFigmaMcpStatus();
+          } catch {
+            fatal(3, 'Failed to add Figma MCP',
+              'Could not add Figma MCP server.\n\n' +
+              'Try manually: claude mcp add --scope user --transport http figma https://mcp.figma.com/mcp');
             return;
           }
         }
+
+        // Auto-authenticate if needed (opens browser for OAuth)
+        if (mcpStatus === 'needs-auth') {
+          updateCheck(3, { status: 'checking', detail: 'Authenticating...' });
+          setAuthProgress('Preparing authentication...');
+          setPhase('authenticating-figma');
+          const authed = await authenticateFigmaMcp((msg) => setAuthProgress(msg));
+          setPhase('running');
+          if (!authed) {
+            fatal(3, 'Authentication failed or timed out',
+              'Figma authentication did not complete.\n\n' +
+              'Try manually:\n' +
+              '1. Run: claude\n' +
+              '2. Type /mcp, select figma, Authenticate\n' +
+              '3. Complete login in browser, then restart figmaxxing');
+            return;
+          }
+          mcpStatus = 'connected';
+        }
+
+        // Warmup probe for --print mode
+        if (mcpStatus === 'connected') {
+          updateCheck(3, { status: 'checking', detail: 'Warming up MCP...' });
+          const result = await checkClaudeAvailable();
+          if (!result.mcpWarmedUp) {
+            const warmed = await warmupMcp();
+            if (!warmed) {
+              fatal(3, 'Figma MCP warmup failed',
+                'Could not initialize Figma MCP for non-interactive use.\n\n' +
+                'Please open Claude manually, type "list mcp tools", then restart figmaxxing.');
+              return;
+            }
+          }
+        }
+
         updateCheck(3, { status: 'ok', detail: 'Connected' });
       } catch {
         fatal(3, 'Check failed',
@@ -268,6 +302,13 @@ export default function SetupWizard({ onComplete }: Props) {
       {phase === 'installing-chromium' && (
         <Box marginTop={1}>
           <Text><Spinner type="dots" /> Installing Playwright Chromium...</Text>
+        </Box>
+      )}
+
+      {phase === 'authenticating-figma' && (
+        <Box marginTop={1} flexDirection="column">
+          <Text><Spinner type="dots" /> {authProgress || 'Preparing authentication...'}</Text>
+          <Text dimColor>This may take 20-30 seconds before the browser opens.</Text>
         </Box>
       )}
 
